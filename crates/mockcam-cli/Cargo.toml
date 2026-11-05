@@ -1,0 +1,12 @@
+[package]
+name = "mockcam-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mockcam"
+path = "src/main.rs"
+
+[dependencies]
+mockcam-core.workspace = true
+anyhow.workspace = true

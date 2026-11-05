@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MockCam
+Comment=Painel da câmera virtual
+Exec=mockcam-panel
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;

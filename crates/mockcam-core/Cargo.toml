@@ -1,0 +1,14 @@
+[package]
+name = "mockcam-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gst.workspace = true
+gst-app.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

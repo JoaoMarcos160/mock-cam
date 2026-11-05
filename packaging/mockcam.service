@@ -1,0 +1,12 @@
+[Unit]
+Description=MockCam — câmera virtual
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/mockcamd
+Restart=on-failure
+RestartSec=2
+Environment=MOCKCAM_LOG=info
+
+[Install]
+WantedBy=default.target

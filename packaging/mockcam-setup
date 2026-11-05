@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Instala e carrega o v4l2loopback para o MockCam. Único passo que exige root.
+# uso: sudo ./mockcam-setup [--deps]   (--deps também instala pacotes GStreamer/dev)
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "rode com sudo"; exit 1; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ "${1:-}" == "--deps" ]]; then
+  # Repositórios de terceiros quebrados (404/chave GPG) fazem o update sair com erro,
+  # mas os índices do Ubuntu continuam válidos — então não abortamos aqui.
+  apt-get update || echo "aviso: 'apt-get update' teve erros em repositórios de terceiros; seguindo com os índices existentes"
+  apt-get install -y \
+    v4l2loopback-dkms v4l2loopback-utils v4l-utils "linux-headers-$(uname -r)" \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-vaapi gstreamer1.0-gl \
+    build-essential pkg-config intel-gpu-tools \
+    || echo "aviso: apt-get install terminou com erro; tentando concluir o v4l2loopback abaixo"
+fi
+
+# Garante o módulo compilado para o kernel EM USO (o DKMS do apt pode falhar em outro kernel).
+KVER="$(uname -r)"
+if ! modinfo -k "$KVER" v4l2loopback >/dev/null 2>&1; then
+  VER="$(dpkg-query -W -f='${Version}' v4l2loopback-dkms 2>/dev/null | sed 's/-.*//')"
+  [[ -n "$VER" ]] || { echo "v4l2loopback-dkms não instalado (rode com --deps)"; exit 1; }
+  echo "compilando v4l2loopback $VER para $KVER…"
+  dkms install "v4l2loopback/$VER" -k "$KVER" || {
+    echo "falhou; log:"; tail -30 "/var/lib/dkms/v4l2loopback/$VER/build/make.log" 2>/dev/null; exit 1; }
+fi
+dpkg --configure -a || true
+
+install -m 644 "$HERE/modprobe/mockcam.conf"     /etc/modprobe.d/mockcam.conf
+install -m 644 "$HERE/modules-load/mockcam.conf" /etc/modules-load.d/mockcam.conf
+
+if lsmod | grep -q '^v4l2loopback'; then
+  echo "v4l2loopback já carregado; recarregando com os parâmetros do MockCam…"
+  modprobe -r v4l2loopback || { echo "não deu para descarregar (algum app usando a câmera?)"; exit 1; }
+fi
+modprobe v4l2loopback
+sleep 0.5
+if [[ -e /dev/video10 ]]; then
+  echo "OK: $(cat /sys/class/video4linux/video10/name) em /dev/video10"
+else
+  echo "falhou: /dev/video10 não apareceu (veja dmesg)"; exit 1
+fi
