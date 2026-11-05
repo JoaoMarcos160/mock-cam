@@ -72,12 +72,43 @@ const V4L2_FIELD_NONE: u32 = 1;
 const V4L2_COLORSPACE_SMPTE170M: u32 = 1; // BT.601, o que o v4l2loopback anuncia
 /// _IOWR('V', 5, struct v4l2_format)
 const VIDIOC_S_FMT: libc::c_ulong = 0xC0D0_5605;
+/// _IOW('V', 18, int)
+const VIDIOC_STREAMON: libc::c_ulong = 0x4004_5612;
+
+/// Registra este fd como escritor no v4l2loopback. Essencial: no 0.12.x, um escritor
+/// que só usa write() nunca é marcado como WRITER, e ao fechar o driver não volta a
+/// anunciar saída — o dispositivo fica travado (S_FMT → EINVAL) até recarregar o módulo.
+fn stream_on(f: &File) -> std::io::Result<()> {
+    let mut t: libc::c_int = V4L2_BUF_TYPE_VIDEO_OUTPUT as libc::c_int;
+    // SAFETY: fd válido; o argumento é um int com o tipo de buffer.
+    let r = unsafe { libc::ioctl(f.as_raw_fd(), VIDIOC_STREAMON, &mut t as *mut libc::c_int) };
+    if r < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 const fn fourcc(s: &[u8; 4]) -> u32 {
     (s[0] as u32) | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24
 }
 
 fn open_device(cfg: &OutputCfg, frame_size: usize) -> Result<File> {
+    match try_open_device(cfg, frame_size) {
+        Ok(f) => Ok(f),
+        Err(first) => {
+            // Recuperação de um dispositivo travado por um escritor anterior (ver stream_on):
+            // STREAMON + close faz o driver voltar a anunciar saída. Depois tenta de novo.
+            tracing::warn!("{first:#}; tentando recuperar o dispositivo");
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&cfg.device) {
+                let _ = stream_on(&f);
+            }
+            try_open_device(cfg, frame_size).map_err(|e| e.context(format!("recuperação falhou (antes: {first:#})")))
+        }
+    }
+}
+
+fn try_open_device(cfg: &OutputCfg, frame_size: usize) -> Result<File> {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .open(&cfg.device)
@@ -122,6 +153,7 @@ fn open_device(cfg: &OutputCfg, frame_size: usize) -> Result<File> {
             fmt.pix.height
         );
     }
+    stream_on(&f).with_context(|| format!("VIDIOC_STREAMON em {}", cfg.device))?;
     Ok(f)
 }
 
@@ -132,26 +164,7 @@ pub struct Output {
 
 impl Output {
     pub fn start(cfg: &OutputCfg, router: Arc<FrameRouter>, stats: Arc<OutStats>) -> Result<Output> {
-        let frame_size = util::black_frame(cfg).size();
-        let dev = if std::path::Path::new(&cfg.device).exists() {
-            match open_device(cfg, frame_size) {
-                Ok(f) => {
-                    *stats.error.lock().unwrap() = None;
-                    Some(f)
-                }
-                Err(e) => {
-                    *stats.error.lock().unwrap() = Some(format!("{e:#}"));
-                    None
-                }
-            }
-        } else {
-            *stats.error.lock().unwrap() = Some(format!(
-                "dispositivo {} não existe — rode `sudo mockcam-setup` (v4l2loopback). Saída descartada.",
-                cfg.device
-            ));
-            None
-        };
-        stats.device_ok.store(dev.is_some(), Ordering::Relaxed);
+        let dev = try_attach(cfg, &stats);
 
         let stop = Arc::new(AtomicBool::new(false));
         let cfg = cfg.clone();
@@ -172,6 +185,31 @@ impl Output {
     }
 }
 
+/// Abre o dispositivo e atualiza o status (erro visível no painel/CLI).
+fn try_attach(cfg: &OutputCfg, stats: &OutStats) -> Option<File> {
+    let frame_size = util::black_frame(cfg).size();
+    let dev = if std::path::Path::new(&cfg.device).exists() {
+        match open_device(cfg, frame_size) {
+            Ok(f) => {
+                *stats.error.lock().unwrap() = None;
+                Some(f)
+            }
+            Err(e) => {
+                *stats.error.lock().unwrap() = Some(format!("{e:#}"));
+                None
+            }
+        }
+    } else {
+        *stats.error.lock().unwrap() = Some(format!(
+            "dispositivo {} não existe — rode `sudo mockcam-setup` (v4l2loopback). Saída descartada.",
+            cfg.device
+        ));
+        None
+    };
+    stats.device_ok.store(dev.is_some(), Ordering::Relaxed);
+    dev
+}
+
 fn run(cfg: OutputCfg, mut dev: Option<File>, router: Arc<FrameRouter>, stats: Arc<OutStats>, stop: Arc<AtomicBool>) {
     let period = Duration::from_nanos(1_000_000_000 / cfg.fps as u64);
     let black = util::black_frame(&cfg);
@@ -181,6 +219,7 @@ fn run(cfg: OutputCfg, mut dev: Option<File>, router: Arc<FrameRouter>, stats: A
     let mut n: u64 = 0;
     let (mut win_start, mut win_out, mut win_in) = (Instant::now(), 0u64, router.raw.count());
     let mut last_err = Instant::now() - Duration::from_secs(10);
+    let mut last_attach = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         // Relógio absoluto (sem drift); se atrasou demais, ressincroniza em vez de "correr atrás".
@@ -201,11 +240,22 @@ fn run(cfg: OutputCfg, mut dev: Option<File>, router: Arc<FrameRouter>, stats: A
             }
         }
 
+        // Sem dispositivo (ausente, travado ou erro de escrita): tenta reabrir a cada 2 s.
+        if dev.is_none() && last_attach.elapsed() >= Duration::from_secs(2) {
+            last_attach = Instant::now();
+            dev = try_attach(&cfg, &stats);
+            if dev.is_some() {
+                tracing::info!("saída reconectada a {}", cfg.device);
+            }
+        }
+
+        let mut write_failed = false;
         if let Some(f) = dev.as_mut() {
             let base = held.as_ref().unwrap_or(&black);
             if let Ok(map) = base.map_readable() {
                 // Um write() = um frame no v4l2loopback.
                 if let Err(e) = f.write_all(&map[..expected]) {
+                    write_failed = true;
                     if last_err.elapsed() > Duration::from_secs(5) {
                         tracing::warn!("escrita na saída falhou: {e}");
                         *stats.error.lock().unwrap() = Some(format!("escrita em {} falhou: {e}", cfg.device));
@@ -213,6 +263,12 @@ fn run(cfg: OutputCfg, mut dev: Option<File>, router: Arc<FrameRouter>, stats: A
                     }
                 }
             }
+        }
+        if write_failed {
+            // Fecha e deixa a lógica acima reabrir (recupera de estados ruins do driver).
+            dev = None;
+            stats.device_ok.store(false, Ordering::Relaxed);
+            last_attach = Instant::now();
         }
         n += 1;
         win_out += 1;
